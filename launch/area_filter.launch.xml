@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <launch xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/MapIV/ros2-design/gh-pages/articles/specs/launch.0.1.1.xsd" version="0.1.1">
   <node pkg="map4_smartpole_detection_filter" exec="area_filter" name="area_filter" output="screen">
-    <param name="config_path" value="/home/map4/map4_smartpole/data/komae_danchi/detection_filter" />
+    <param name="config_path" value="/home/map4/map4_smartpole/data/komae_izumitamagawa/detection_filter" />
     <remap from="input/objects" to="/perception/lidar/tracked/objects" />
     <remap from="output/objects" to="/perception/lidar/tracked/filtered_objects" />
     <remap from="output/markers" to="/perception/lidar/area_filter/markers" />

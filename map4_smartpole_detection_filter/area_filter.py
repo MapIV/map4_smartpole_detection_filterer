@@ -142,13 +142,21 @@ class AreaFilter(Node):
         for object in in_msg.objects:
             point = [object.kinematics.pose_with_covariance.pose.position.x, object.kinematics.pose_with_covariance.pose.position.y]
 
+            found_black = False
             for path in self.black_paths:
                 if path.contains_point(point):
-                    continue
+                    found_black = True
+                    break
 
-            for path in self.white_paths:
-                if path.contains_point(point):
-                    out_msg.objects.append(object)
+            if found_black:
+                continue
+
+            if self.white_paths:
+                for path in self.white_paths:
+                    if path.contains_point(point):
+                        out_msg.objects.append(object)
+            else:
+                out_msg.objects.append(object)
 
         self.pub_objects.publish(out_msg)
 
