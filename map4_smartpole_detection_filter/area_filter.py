@@ -1,10 +1,10 @@
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import rclpy
 import rclpy.time
-from autoware_perception_msgs.msg import DetectedObjects
+from autoware_perception_msgs.msg import TrackedObject, TrackedObjects
 from geometry_msgs.msg import Point
 from matplotlib.path import Path as MplPath
 from rclpy.impl.logging_severity import LoggingSeverity
@@ -15,11 +15,7 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from tf2_ros import Buffer, TransformListener
-from transforms3d.euler import euler2mat
 from visualization_msgs.msg import Marker, MarkerArray
-
-from .area_filter_model import AreaFilterRootSchema, Type
 
 
 class AreaFilter(Node):
@@ -41,11 +37,6 @@ class AreaFilter(Node):
         config_path = Path(
             self.declare_parameter("config_path", "").get_parameter_value().string_value
         )
-        self.target_frame = (
-            self.declare_parameter("target_frame", "base_link")
-            .get_parameter_value()
-            .string_value
-        )
 
         best_effort_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -58,85 +49,106 @@ class AreaFilter(Node):
             depth=1,
         )
 
-        self.sub_objects = self.create_subscription(
-            DetectedObjects,
-            "input/objects",
-            self.callback_objects,
-            best_effort_profile if sub_qos == "best_effort" else reliable_profile,
-        )
-        self.pub_objects = self.create_publisher(
-            DetectedObjects,
-            "output/objects",
-            best_effort_profile if pub_qos == "best_effort" else reliable_profile,
-        )
-        self.pub_markers = self.create_publisher(
-            MarkerArray,
-            "output/markers",
-            QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL),
-        )
-
-        with config_path.open() as fp:
-            self.config = AreaFilterRootSchema.model_validate_json(fp.read())
-
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        time_now = self.get_clock().now()
-
-        markers = MarkerArray()
-        self.paths: List[Tuple[MplPath, Type]] = []
-        for i, data in enumerate(self.config.data):
-            polygons = (
-                np.array(data.polygons)
-                - np.array([90918.756000, 95035.654000, 157.450000])
-            ) @ euler2mat(0.029, -0.019, -0.041)
-
-            marker = Marker()
-            marker.header.frame_id = self.target_frame
-            marker.header.stamp = time_now.to_msg()
-            marker.ns = f"area_filter-{i:03d}-{data.type}"
-            marker.id = i
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD
-            marker.scale.x = 0.1
-            marker.scale.y = 0.1
-            marker.scale.z = 0.1
-            marker.color.a = 1.0
-            marker.color.r = 1.0 if data.type == "white" else 0.0
-            marker.color.g = 0.0 if data.type == "white" else 1.0
-            marker.color.b = 0.0 if data.type == "white" else 1.0
-            marker.points = [Point(x=x, y=y, z=z) for x, y, z in polygons]
-            markers.markers.append(marker)
-
-            self.paths.append((MplPath(polygons[:, :2]), data.type))
-
-        self.pub_markers.publish(markers)
-
-    def callback_objects(self, in_msg: DetectedObjects):
-        out_msg = DetectedObjects()
-        out_msg.header = in_msg.header
-
-        in_points = np.array(
-            [
-                [
-                    in_object.kinematics.pose_with_covariance.pose.position.x,
-                    in_object.kinematics.pose_with_covariance.pose.position.y,
-                ]
-                for in_object in in_msg.objects
-            ]
-        )
-        should_remain = []
-        for path, type in self.paths:
-            contains_points = path.contains_points(in_points)
-            should_remain.append(
-                contains_points if type == Type.white else ~contains_points
+        if config_path.exists():
+            self.sub_objects = self.create_subscription(
+                TrackedObjects,
+                "input/objects",
+                self.callback,
+                best_effort_profile if sub_qos == "best_effort" else reliable_profile,
+            )
+            self.pub_objects = self.create_publisher(
+                TrackedObjects,
+                "output/objects",
+                best_effort_profile if pub_qos == "best_effort" else reliable_profile,
+            )
+            self.pub_markers = self.create_publisher(
+                MarkerArray,
+                "output/markers",
+                QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL),
             )
 
-        should_remain = np.logical_and.reduce(should_remain)
+            markers = MarkerArray()
 
-        for i, in_object in enumerate(in_msg.objects):
-            if should_remain[i]:
-                out_msg.objects.append(in_object)
+            self.white_paths: List[MplPath] = []
+            count = 0
+            for path in config_path.glob("*.white.txt"):
+                self.get_logger().info(f"Loading whitelist: {path}")
+                with path.open() as fp:
+                    points = []
+                    polygon = []
+                    for line in fp:
+                        x, y, z = tuple(map(float, line.strip().split(",")))
+                        points.append(Point(x=x, y=y, z=z))
+                        polygon.append((x, y))
+
+                    marker = Marker()
+                    marker.header.frame_id = "map"
+                    marker.header.stamp = self.get_clock().now().to_msg()
+                    marker.ns = f"area_filter-{count:04d}-white"
+                    marker.id = count
+                    marker.type = Marker.LINE_STRIP
+                    marker.action = Marker.ADD
+                    marker.scale.x = 0.1
+                    marker.scale.y = 0.1
+                    marker.scale.z = 0.1
+                    marker.color.a = 1.0
+                    marker.color.r = 1.0
+                    marker.color.g = 0.0
+                    marker.color.b = 0.0
+                    marker.points = points
+                    markers.markers.append(marker)
+
+                    self.white_paths.append(MplPath(np.array(polygon)))
+                    count += 1
+
+            self.black_paths: List[MplPath] = []
+            for path in config_path.glob("*.black.txt"):
+                self.get_logger().info(f"Loading blacklist: {path}")
+                with path.open() as fp:
+                    points = []
+                    polygon = []
+                    for line in fp:
+                        x, y, z = tuple(map(float, line.strip().split(",")))
+                        points.append(Point(x=x, y=y, z=z))
+                        polygon.append((x, y))
+
+                    marker = Marker()
+                    marker.header.frame_id = "map"
+                    marker.header.stamp = self.get_clock().now().to_msg()
+                    marker.ns = f"area_filter-{count:04d}-black"
+                    marker.id = count
+                    marker.type = Marker.LINE_STRIP
+                    marker.action = Marker.ADD
+                    marker.scale.x = 0.1
+                    marker.scale.y = 0.1
+                    marker.scale.z = 0.1
+                    marker.color.a = 1.0
+                    marker.color.r = 0.0
+                    marker.color.g = 1.0
+                    marker.color.b = 1.0
+                    marker.points = points
+                    markers.markers.append(marker)
+
+                    self.black_paths.append(MplPath(np.array(polygon)))
+                    count += 1
+
+            self.pub_markers.publish(markers)
+
+    def callback(self, in_msg: TrackedObjects):
+        out_msg = TrackedObjects()
+        out_msg.header = in_msg.header
+
+        object: TrackedObject
+        for object in in_msg.objects:
+            point = [object.kinematics.pose_with_covariance.pose.position.x, object.kinematics.pose_with_covariance.pose.position.y]
+
+            for path in self.black_paths:
+                if path.contains_point(point):
+                    continue
+
+            for path in self.white_paths:
+                if path.contains_point(point):
+                    out_msg.objects.append(object)
 
         self.pub_objects.publish(out_msg)
 
