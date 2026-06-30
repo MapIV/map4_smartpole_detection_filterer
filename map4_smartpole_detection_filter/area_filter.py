@@ -1,10 +1,14 @@
 import colorsys
+import math
+import time
 from pathlib import Path
 from typing import List
 
 import numpy as np
 import rclpy
 from autoware_perception_msgs.msg import TrackedObject, TrackedObjects
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from geometry_msgs.msg import Point
 from matplotlib.path import Path as MplPath
 from rclpy.impl.logging_severity import LoggingSeverity
@@ -37,6 +41,16 @@ class AreaFilter(Node):
         config_path = Path(
             self.declare_parameter("config_path", "").get_parameter_value().string_value
         )
+
+        # ASIL-A self-diagnostics. The most important signal is the silent
+        # mis-configuration: a missing config_path leaves the node subscribed to nothing,
+        # so the filter is inactive without any error. Surface that as ERROR.
+        self._config_loaded = config_path.exists()
+        self._diag_msgs_in = 0
+        self._diag_objects_in = 0
+        self._diag_objects_out = 0
+        self._diag_nonfinite = 0
+        self._diag_last_input = time.monotonic()
 
         best_effort_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -198,16 +212,62 @@ class AreaFilter(Node):
 
             self.pub_markers.publish(markers)
 
+        # Always start diagnostics, even when config is missing (so the inactive-filter
+        # state is reported rather than silently swallowed).
+        diag_period = float(self.declare_parameter("diagnostics.period_sec", 1.0).value)
+        self._updater = Updater(self)
+        self._updater.setHardwareID(
+            self.declare_parameter("diagnostics.hardware_id", "detection_filter").value
+        )
+        self._updater.add("area_filter", self._diag_task)
+        self._diag_timer = self.create_timer(
+            diag_period, lambda: self._updater.force_update()
+        )
+
+    def _diag_task(self, stat):
+        age = time.monotonic() - self._diag_last_input
+        if not self._config_loaded:
+            level = DiagnosticStatus.ERROR
+            message = "config_path missing: filter inactive (passing nothing)"
+        elif self._diag_msgs_in == 0 and age > 5.0:
+            level, message = DiagnosticStatus.ERROR, "No input objects received"
+        elif age > 5.0:
+            level, message = DiagnosticStatus.ERROR, "Input objects stalled"
+        elif self._diag_nonfinite > 0:
+            level = DiagnosticStatus.WARN
+            message = "Non-finite object positions observed"
+        else:
+            level, message = DiagnosticStatus.OK, "Filtering nominally"
+        n_white = len(getattr(self, "white_paths", [])) if self._config_loaded else 0
+        n_black = len(getattr(self, "black_paths", [])) if self._config_loaded else 0
+        stat.summary(level, message)
+        stat.add("config_loaded", str(self._config_loaded))
+        stat.add("whitelist_polygons", str(n_white))
+        stat.add("blacklist_polygons", str(n_black))
+        stat.add("messages_in_total", str(self._diag_msgs_in))
+        stat.add("objects_in_total", str(self._diag_objects_in))
+        stat.add("objects_out_total", str(self._diag_objects_out))
+        stat.add("objects_filtered_total", str(self._diag_objects_in - self._diag_objects_out))
+        stat.add("nonfinite_positions_total", str(self._diag_nonfinite))
+        stat.add("input_age_sec", f"{age:.2f}")
+        return stat
+
     def callback(self, in_msg: TrackedObjects):
+        self._diag_last_input = time.monotonic()
+        self._diag_msgs_in += 1
+        self._diag_objects_in += len(in_msg.objects)
+
         out_msg = TrackedObjects()
         out_msg.header = in_msg.header
 
         object: TrackedObject
         for object in in_msg.objects:
-            point = [
-                object.kinematics.pose_with_covariance.pose.position.x,
-                object.kinematics.pose_with_covariance.pose.position.y,
-            ]
+            px = object.kinematics.pose_with_covariance.pose.position.x
+            py = object.kinematics.pose_with_covariance.pose.position.y
+            if not (math.isfinite(px) and math.isfinite(py)):
+                self._diag_nonfinite += 1
+                continue  # FSR-1.1: drop objects with non-finite position
+            point = [px, py]
 
             found_black = False
             for path in self.black_paths:
@@ -225,6 +285,7 @@ class AreaFilter(Node):
             else:
                 out_msg.objects.append(object)
 
+        self._diag_objects_out += len(out_msg.objects)
         self.pub_objects.publish(out_msg)
 
 
