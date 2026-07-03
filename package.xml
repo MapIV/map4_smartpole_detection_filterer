@@ -3,9 +3,9 @@
 <package format="3">
   <name>map4_smartpole_detection_filter</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Area-based keep/reject-polygon filter for tracked objects in the map frame (disabled by default).</description>
   <maintainer email="keisuke.urasaki@map4.jp">map4</maintainer>
-  <license>Apache 2.0</license>
+  <license>Apache-2.0</license>
 
   <exec_depend>diagnostic_updater</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
