@@ -94,10 +94,30 @@ class AreaFilter(Node):
                     polygon = []
                     z_values = []
                     for line in fp:
-                        x, y, z = tuple(map(float, line.strip().split(",")))
+                        stripped = line.strip()
+                        if not stripped:
+                            continue  # EDG-M8: skip blank lines
+                        try:
+                            x, y, z = tuple(map(float, stripped.split(",")))
+                        except ValueError:
+                            # EDG-M8: a malformed row must not raise during __init__ (that would
+                            # leave the node dead on construction, with no diagnostics either).
+                            self.get_logger().warning(
+                                f"Skipping malformed polygon row in {path.name}: {stripped!r}"
+                            )
+                            continue
                         points.append(Point(x=x, y=y, z=z))
                         polygon.append((x, y))
                         z_values.append(z)
+
+                    if len(polygon) < 3:
+                        # EDG-M8: a degenerate polygon (<3 valid vertices) would build a
+                        # meaningless MplPath; skip it rather than filter on garbage.
+                        self.get_logger().warning(
+                            f"Skipping polygon {path.name}: only {len(polygon)} valid vertices "
+                            "(need >=3)"
+                        )
+                        continue
 
                     hue = (count * golden_ratio_conjugate) % 1.0
                     saturation = 1.0
@@ -156,10 +176,30 @@ class AreaFilter(Node):
                     polygon = []
                     z_values = []
                     for line in fp:
-                        x, y, z = tuple(map(float, line.strip().split(",")))
+                        stripped = line.strip()
+                        if not stripped:
+                            continue  # EDG-M8: skip blank lines
+                        try:
+                            x, y, z = tuple(map(float, stripped.split(",")))
+                        except ValueError:
+                            # EDG-M8: a malformed row must not raise during __init__ (that would
+                            # leave the node dead on construction, with no diagnostics either).
+                            self.get_logger().warning(
+                                f"Skipping malformed polygon row in {path.name}: {stripped!r}"
+                            )
+                            continue
                         points.append(Point(x=x, y=y, z=z))
                         polygon.append((x, y))
                         z_values.append(z)
+
+                    if len(polygon) < 3:
+                        # EDG-M8: a degenerate polygon (<3 valid vertices) would build a
+                        # meaningless MplPath; skip it rather than filter on garbage.
+                        self.get_logger().warning(
+                            f"Skipping polygon {path.name}: only {len(polygon)} valid vertices "
+                            "(need >=3)"
+                        )
+                        continue
 
                     hue = (count * golden_ratio_conjugate) % 1.0
                     saturation = 1.0
@@ -214,15 +254,16 @@ class AreaFilter(Node):
 
         # Always start diagnostics, even when config is missing (so the inactive-filter
         # state is reported rather than silently swallowed).
+        # EDG-M9: diagnostic_updater.Updater already creates its OWN internal timer (period from
+        # the diagnostic_updater.period param). A second explicit force_update() timer double-
+        # published /diagnostics and left diagnostics.period_sec racy; pass the period in and let
+        # the Updater's single internal timer drive updates.
         diag_period = float(self.declare_parameter("diagnostics.period_sec", 1.0).value)
-        self._updater = Updater(self)
+        self._updater = Updater(self, diag_period)
         self._updater.setHardwareID(
             self.declare_parameter("diagnostics.hardware_id", "detection_filter").value
         )
         self._updater.add("area_filter", self._diag_task)
-        self._diag_timer = self.create_timer(
-            diag_period, lambda: self._updater.force_update()
-        )
 
     def _diag_task(self, stat):
         age = time.monotonic() - self._diag_last_input
@@ -282,6 +323,7 @@ class AreaFilter(Node):
                 for path in self.white_paths:
                     if path.contains_point(point):
                         out_msg.objects.append(object)
+                        break  # EDG-M7: emit at most once even if inside several whitelist polygons
             else:
                 out_msg.objects.append(object)
 
