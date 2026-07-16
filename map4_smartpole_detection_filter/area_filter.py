@@ -42,9 +42,9 @@ class AreaFilter(Node):
             self.declare_parameter("config_path", "").get_parameter_value().string_value
         )
 
-        # ASIL-A self-diagnostics. The most important signal is the silent
-        # mis-configuration: a missing config_path leaves the node subscribed to nothing,
-        # so the filter is inactive without any error. Surface that as ERROR.
+        # ASIL-A self-diagnostics. The area filter is OPT-IN: with no config the node still
+        # subscribes and passes every object through, and reports that inactive state at OK
+        # (INFO) -- it is an expected configuration, not a fault. _config_loaded is a diag field.
         self._config_loaded = config_path.exists()
         self._diag_msgs_in = 0
         self._diag_objects_in = 0
@@ -63,29 +63,33 @@ class AreaFilter(Node):
             depth=1,
         )
 
+        # Opt-in area filter: the subscription and publishers are ALWAYS created, so a pole
+        # with no area config -- or an empty one -- passes every object through (see callback).
+        # A missing/empty config is a valid "filter disabled" state, not a fault. Polygons are
+        # loaded only when a config directory is present.
+        self.sub_objects = self.create_subscription(
+            TrackedObjects,
+            "input/objects",
+            self.callback,
+            best_effort_profile if sub_qos == "best_effort" else reliable_profile,
+        )
+        self.pub_objects = self.create_publisher(
+            TrackedObjects,
+            "output/objects",
+            best_effort_profile if pub_qos == "best_effort" else reliable_profile,
+        )
+        self.pub_markers = self.create_publisher(
+            MarkerArray,
+            "output/markers",
+            QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL),
+        )
+
+        markers = MarkerArray()
+        golden_ratio_conjugate = 0.61803398875
+        self.white_paths: List[MplPath] = []
+        self.black_paths: List[MplPath] = []
+
         if config_path.exists():
-            self.sub_objects = self.create_subscription(
-                TrackedObjects,
-                "input/objects",
-                self.callback,
-                best_effort_profile if sub_qos == "best_effort" else reliable_profile,
-            )
-            self.pub_objects = self.create_publisher(
-                TrackedObjects,
-                "output/objects",
-                best_effort_profile if pub_qos == "best_effort" else reliable_profile,
-            )
-            self.pub_markers = self.create_publisher(
-                MarkerArray,
-                "output/markers",
-                QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL),
-            )
-
-            markers = MarkerArray()
-
-            golden_ratio_conjugate = 0.61803398875
-
-            self.white_paths: List[MplPath] = []
             count = 0
             for path in config_path.glob("*.white.txt"):
                 self.get_logger().info(f"Loading whitelist: {path}")
@@ -168,7 +172,6 @@ class AreaFilter(Node):
                     self.white_paths.append(MplPath(polygon_np))
                     count += 1
 
-            self.black_paths: List[MplPath] = []
             for path in config_path.glob("*.black.txt"):
                 self.get_logger().info(f"Loading blacklist: {path}")
                 with path.open() as fp:
@@ -252,6 +255,18 @@ class AreaFilter(Node):
 
             self.pub_markers.publish(markers)
 
+        # Report the opt-in state at INFO: active (with polygons) or pass-through (no config).
+        if self.white_paths or self.black_paths:
+            self.get_logger().info(
+                f"Area filter active: {len(self.white_paths)} whitelist, "
+                f"{len(self.black_paths)} blacklist polygon(s)."
+            )
+        else:
+            self.get_logger().info(
+                f"Area filter inactive (opt-in): no polygons at '{config_path}' -- "
+                "passing all objects through."
+            )
+
         # Always start diagnostics, even when config is missing (so the inactive-filter
         # state is reported rather than silently swallowed).
         # EDG-M9: diagnostic_updater.Updater already creates its OWN internal timer (period from
@@ -267,9 +282,14 @@ class AreaFilter(Node):
 
     def _diag_task(self, stat):
         age = time.monotonic() - self._diag_last_input
-        if not self._config_loaded:
-            level = DiagnosticStatus.ERROR
-            message = "config_path missing: filter inactive (passing nothing)"
+        n_white = len(getattr(self, "white_paths", []))
+        n_black = len(getattr(self, "black_paths", []))
+        # Opt-in filter: with no polygons (config absent or empty) the node passes every object
+        # through by design -> OK (INFO), not a fault. Stall / non-finite checks only apply when
+        # the filter is actually active (has polygons).
+        if n_white == 0 and n_black == 0:
+            level = DiagnosticStatus.OK
+            message = "area filter inactive (no config): passing all objects through"
         elif self._diag_msgs_in == 0 and age > 5.0:
             level, message = DiagnosticStatus.ERROR, "No input objects received"
         elif age > 5.0:
@@ -279,8 +299,6 @@ class AreaFilter(Node):
             message = "Non-finite object positions observed"
         else:
             level, message = DiagnosticStatus.OK, "Filtering nominally"
-        n_white = len(getattr(self, "white_paths", [])) if self._config_loaded else 0
-        n_black = len(getattr(self, "black_paths", [])) if self._config_loaded else 0
         stat.summary(level, message)
         stat.add("config_loaded", str(self._config_loaded))
         stat.add("whitelist_polygons", str(n_white))
